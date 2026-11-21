@@ -8,17 +8,58 @@
 * 时间边界比较容差为 1 ms：两个时间值相差不超过 1 ms 视为相等，
   因此首尾相接的字幕不算重叠。
 * 一条字幕是只含 ``start``、``end``、``text`` 三个键的普通 ``dict``。
-
-本模块初始为缺陷环境：8 个函数均为桩，调用会抛出
-``NotImplementedError``。请实现函数体，不要修改测试。
 """
 
 import math
-import re
+import string
+import unicodedata
+
+_TOLERANCE_MS = 1
 
 
 class CpsError(ValueError):
     """字幕、时间值或 CPS 限制非法时抛出的异常。"""
+
+
+def _is_punctuation(ch) -> bool:
+    """判断单个字符是否按标点计权（ASCII 标点以及 Unicode 标点类）。"""
+    return ch in string.punctuation or unicodedata.category(ch).startswith("P")
+
+
+def _is_space(ch) -> bool:
+    return ch.isspace()
+
+
+def _char_weight(ch) -> float:
+    """单个字符的有效字符权重：空白 0，标点 0.5，其他 1。"""
+    if _is_space(ch):
+        return 0.0
+    if _is_punctuation(ch):
+        return 0.5
+    return 1.0
+
+
+def _is_number(value) -> bool:
+    return isinstance(value, (int, float)) and not isinstance(value, bool)
+
+
+def _finite_number(value, name, *, positive=False) -> float:
+    """校验 ``value`` 是有限数（可选地要求为正数）。"""
+    if not _is_number(value) or not math.isfinite(float(value)):
+        raise CpsError(f"{name} must be a finite number")
+    number = float(value)
+    if positive and number <= 0:
+        raise CpsError(f"{name} must be positive")
+    return number
+
+
+def _copy_cue(cue) -> dict:
+    """返回只含 ``start`` / ``end`` / ``text`` 的新字典。"""
+    return {
+        "start": cue["start"],
+        "end": cue["end"],
+        "text": cue["text"],
+    }
 
 
 def char_count(text) -> int:
@@ -35,7 +76,12 @@ def char_count(text) -> int:
     加权和可能为半整数（出现奇数个标点时）；返回类型标注沿用题面
     的 ``int``，需要整数值的调用方应使用加权和为整数的文本或自行取整。
     """
-    raise NotImplementedError
+    if text is None:
+        return 0
+    total = math.fsum(_char_weight(ch) for ch in text)
+    if float(total).is_integer():
+        return int(total)
+    return total
 
 
 def cps(cue) -> float:
@@ -47,7 +93,47 @@ def cps(cue) -> float:
     时长小于等于 0 时抛出 ``CpsError``；空文本或纯空白文本返回
     ``0.0``。时间使用毫秒，结果使用秒，不得再除以 60。
     """
-    raise NotImplementedError
+    duration_ms = cue["end"] - cue["start"]
+    if duration_ms <= 0:
+        raise CpsError("cue duration must be positive")
+    return char_count(cue["text"]) / (duration_ms / 1000.0)
+
+
+def _first_visible(text, start):
+    """返回 ``text[start:]`` 中第一个非空白字符，没有则返回 ``None``。"""
+    for ch in text[start:]:
+        if not _is_space(ch):
+            return ch
+    return None
+
+
+def _can_break(text, position) -> bool:
+    """``position`` 处能否断开：后一段非空且不以标点开头。"""
+    if position <= 0 or position >= len(text):
+        return False
+    first = _first_visible(text, position)
+    return first is not None and not _is_punctuation(first)
+
+
+def _is_natural_break(text, position) -> bool:
+    """断点是否落在标点或空白之后。"""
+    return position > 0 and (
+        _is_punctuation(text[position - 1]) or _is_space(text[position - 1])
+    )
+
+
+def _cumulative_weights(text):
+    cumulative = [0.0]
+    for ch in text:
+        cumulative.append(cumulative[-1] + _char_weight(ch))
+    return cumulative
+
+
+def _max_segments(text) -> int:
+    """在不产生“标点开头”分段的前提下的最大分段数。"""
+    return 1 + sum(
+        1 for position in range(1, len(text)) if _can_break(text, position)
+    )
 
 
 def split_cue(cue, max_cps) -> list[dict]:
@@ -68,7 +154,70 @@ def split_cue(cue, max_cps) -> list[dict]:
     返回的每条字幕只含 ``start``、``end``、``text``，顺序与原文一致，
     且不得修改入参。
     """
-    raise NotImplementedError
+    limit = _finite_number(max_cps, "max_cps", positive=True)
+
+    text = cue["text"]
+    if text is None:
+        text = ""
+    total_weight = char_count(text)
+    if total_weight <= 0:
+        return []
+
+    start = cue["start"]
+    end = cue["end"]
+    current = cps(cue)
+    # 1 ms 时间容差：把容差范围内的高估视为“未超限”。
+    duration = end - start
+    if total_weight <= limit * ((duration + _TOLERANCE_MS) / 1000.0):
+        return [_copy_cue(cue)]
+
+    segments = max(2, math.ceil(current / limit - 1e-9))
+    segments = min(segments, _max_segments(text))
+    if segments < 2:
+        return [_copy_cue(cue)]
+
+    cumulative = _cumulative_weights(text)
+    total = cumulative[-1]
+
+    cuts = []
+    previous = 0
+    for index in range(1, segments):
+        target = total * index / segments
+        lo = previous + 1
+        hi = len(text) - (segments - index)
+        legal = [k for k in range(lo, hi + 1) if _can_break(text, k)]
+        if not legal:
+            return [_copy_cue(cue)]
+        preferred = [k for k in legal if _is_natural_break(text, k)]
+        pool = preferred or legal
+        chosen = min(pool, key=lambda k: (abs(cumulative[k] - target), k))
+        cuts.append(chosen)
+        previous = chosen
+    cuts.append(len(text))
+
+    duration = end - start
+    boundaries = [start]
+    for index in range(1, segments):
+        offset = int(round(duration * cumulative[cuts[index - 1]] / total))
+        timestamp = start + offset
+        timestamp = max(timestamp, boundaries[-1])
+        timestamp = min(timestamp, end)
+        boundaries.append(timestamp)
+    boundaries.append(end)
+
+    parts = []
+    segment_start = 0
+    for index in range(segments):
+        segment_end = cuts[index]
+        parts.append(
+            {
+                "start": boundaries[index],
+                "end": boundaries[index + 1],
+                "text": text[segment_start:segment_end],
+            }
+        )
+        segment_start = segment_end
+    return parts
 
 
 def merge_close(cues, max_gap_ms) -> list:
@@ -84,7 +233,23 @@ def merge_close(cues, max_gap_ms) -> list:
     满足 ``next.start >= current.end``（允许 1 ms 容差），即不重叠。
     ``max_gap_ms`` 小于 0 时抛出 ``CpsError``。返回新字典，不修改入参。
     """
-    raise NotImplementedError
+    gap_limit = _finite_number(max_gap_ms, "max_gap_ms")
+    if gap_limit < 0:
+        raise CpsError("max_gap_ms must be non-negative")
+
+    merged = []
+    for cue in cues:
+        current = _copy_cue(cue)
+        if merged:
+            previous = merged[-1]
+            gap = current["start"] - previous["end"]
+            if gap <= gap_limit:
+                previous["start"] = min(previous["start"], current["start"])
+                previous["end"] = max(previous["end"], current["end"])
+                previous["text"] = (previous["text"] or "") + (current["text"] or "")
+                continue
+        merged.append(current)
+    return merged
 
 
 def enforce_min_duration(cues, min_ms) -> list:
@@ -97,7 +262,33 @@ def enforce_min_duration(cues, min_ms) -> list:
 
     ``min_ms`` 小于 0 时抛出 ``CpsError``。返回新字典，不修改入参。
     """
-    raise NotImplementedError
+    _finite_number(min_ms, "min_ms")
+    if min_ms < 0:
+        raise CpsError("min_ms must be non-negative")
+    minimum = min_ms
+
+    result = []
+    shift = 0
+    previous_end = None
+    for cue in cues:
+        start = cue["start"] + shift
+        end = cue["end"] + shift
+        if end - start < minimum:
+            end = start + minimum
+        if previous_end is not None and start < previous_end - _TOLERANCE_MS:
+            delta = previous_end - start
+            start += delta
+            end += delta
+            shift += delta
+        result.append(
+            {
+                "start": start,
+                "end": end,
+                "text": cue["text"],
+            }
+        )
+        previous_end = end
+    return result
 
 
 def balance_lines(text, max_chars) -> list[str]:
@@ -112,7 +303,36 @@ def balance_lines(text, max_chars) -> list[str]:
     若不存在满足条件的断点，抛出 ``CpsError``，不得返回行首为标点的
     结果。
     """
-    raise NotImplementedError
+    if (
+        not isinstance(max_chars, int)
+        or isinstance(max_chars, bool)
+        or max_chars <= 0
+    ):
+        raise CpsError("max_chars must be a positive integer")
+
+    if text is None:
+        text = ""
+    if len(text) <= max_chars:
+        return [text]
+
+    best = None
+    for position in range(1, len(text)):
+        first = text[:position].rstrip()
+        second = text[position:].lstrip()
+        if not first or not second:
+            continue
+        if _is_punctuation(second[0]):
+            continue
+        if len(first) > max_chars or len(second) > max_chars:
+            continue
+        natural = _is_natural_break(text, position)
+        key = (abs(len(first) - len(second)), 0 if natural else 1, position)
+        if best is None or key < best[0]:
+            best = (key, first, second)
+
+    if best is None:
+        raise CpsError("cannot balance text without a punctuation-leading line")
+    return [best[1], best[2]]
 
 
 def validate_cues(cues, max_cps) -> list[str]:
@@ -129,7 +349,32 @@ def validate_cues(cues, max_cps) -> list[str]:
     ``max_cps`` 必须为有限正数，否则抛出 ``CpsError``。空输入返回
     ``[]``。
     """
-    raise NotImplementedError
+    limit = _finite_number(max_cps, "max_cps", positive=True)
+
+    issues = []
+    previous = None
+    for index, cue in enumerate(cues):
+        start = cue["start"]
+        end = cue["end"]
+        duration = end - start
+        if duration <= 0:
+            issues.append(f"cue {index}: duration must be positive")
+        if previous is not None and start < previous["end"] - _TOLERANCE_MS:
+            issues.append(f"cue {index}: overlaps previous cue")
+        if duration > 0:
+            value = cps(cue)
+            if value > limit:
+                issues.append(
+                    f"cue {index}: cps {value:.2f} exceeds {limit:.2f}"
+                )
+        previous = cue
+    return issues
+
+
+def _config_value(config, key):
+    if not isinstance(config, dict) or key not in config:
+        raise CpsError(f"config: missing {key}")
+    return config[key]
 
 
 def cps_batch(tracks, config) -> dict:
@@ -149,4 +394,60 @@ def cps_batch(tracks, config) -> dict:
     不同轨的字幕列表和字幕字典不得共享引用，也不得与入参共享引用。
     空 ``tracks`` 返回 ``{"tracks": []}``。
     """
-    raise NotImplementedError
+    if not isinstance(tracks, (list, tuple)):
+        raise CpsError("tracks must be a list")
+
+    max_cps = _finite_number(
+        _config_value(config, "max_cps"), "config.max_cps", positive=True
+    )
+    min_ms = _finite_number(_config_value(config, "min_ms"), "config.min_ms")
+    max_gap_ms = _finite_number(
+        _config_value(config, "max_gap_ms"), "config.max_gap_ms"
+    )
+    if min_ms < 0:
+        raise CpsError("config.min_ms must be non-negative")
+    if max_gap_ms < 0:
+        raise CpsError("config.max_gap_ms must be non-negative")
+
+    # 先完整校验所有轨，确保任何错误都发生在处理之前（整体回滚）。
+    for track_index, track in enumerate(tracks):
+        if not isinstance(track, dict) or "id" not in track:
+            raise CpsError(f"track {track_index}: missing id")
+        track_id = track["id"]
+        cues = track.get("cues")
+        if not isinstance(cues, list):
+            raise CpsError(f"track {track_id!r}: cues must be a list")
+        for cue_index, cue in enumerate(cues):
+            if not isinstance(cue, dict) or not all(
+                key in cue for key in ("start", "end", "text")
+            ):
+                raise CpsError(
+                    f"track {track_id!r}: cue {cue_index} is malformed"
+                )
+            if cue["text"] is not None and not isinstance(cue["text"], str):
+                raise CpsError(
+                    f"track {track_id!r}: cue {cue_index} text must be a string"
+                )
+            try:
+                duration = cue["end"] - cue["start"]
+            except TypeError:
+                raise CpsError(
+                    f"track {track_id!r}: cue {cue_index} has invalid times"
+                ) from None
+            if duration <= 0:
+                raise CpsError(
+                    f"track {track_id!r}: cue {cue_index}: duration must be positive"
+                )
+
+    processed = []
+    for track in tracks:
+        cues = [_copy_cue(cue) for cue in track["cues"]]
+        merged = merge_close(cues, max_gap_ms)
+        split = []
+        for cue in merged:
+            split.extend(split_cue(cue, max_cps))
+        adjusted = enforce_min_duration(split, min_ms)
+        validate_cues(adjusted, max_cps)
+        processed.append({"id": track["id"], "cues": adjusted})
+
+    return {"tracks": processed}
